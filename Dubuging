@@ -1,0 +1,460 @@
+# =============================================================================
+# Auditory Perception Distortion Simulation -- Amusia (Fixed & Improved v2)
+# =============================================================================
+# Fixed major bugs: Autoencoder length mismatch, overlapping frames, smoother distortion
+
+from __future__ import annotations
+
+import os
+import warnings
+import random
+from typing import Dict
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+
+import librosa
+import librosa.display
+import soundfile as sf
+from scipy.signal import medfilt, butter, filtfilt
+from scipy.spatial.distance import cosine as cosine_dist
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+CFG = {
+    "audio_path"        : None,          # Set to your .wav/.mp3 path or keep None
+    "sample_rate"       : 22050,
+    "duration"          : 8.0,           # seconds
+    # Distortion
+    "pitch_shift_steps" : 4,
+    "noise_amplitude"   : 0.035,
+    "rhythm_mask_prob"  : 0.18,
+    # Autoencoder
+    "frame_len"         : 512,
+    "hop_len"           : 256,           # 50% overlap
+    "epochs"            : 50,
+    "batch_size"        : 64,
+    "lr"                : 3e-4,
+    "latent_dim"        : 32,
+    # Output
+    "fig_path"          : "amusia_comparison.png",
+    "out_dir"           : "amusia_outputs",
+}
+
+os.makedirs(CFG["out_dir"], exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+print("[INFO] Device:", DEVICE)
+
+
+# =============================================================================
+# 1. AUDIO LOADING / SYNTHESIS
+# =============================================================================
+
+def synthesise_music(sr, duration):
+    t = np.linspace(0, duration, int(sr * duration), endpoint=False)
+    freqs = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25]
+    amps  = [0.40, 0.30, 0.25, 0.20, 0.18, 0.15]
+    note_dur = duration / len(freqs)
+    signal = np.zeros_like(t)
+
+    for i, (f, a) in enumerate(zip(freqs, amps)):
+        s = int(i * note_dur * sr)
+        e = int((i + 1) * note_dur * sr)
+        seg = a * np.sin(2 * np.pi * f * t[s:e])
+        seg += (a * 0.30) * np.sin(2 * np.pi * 2 * f * t[s:e])
+        seg += (a * 0.15) * np.sin(2 * np.pi * 3 * f * t[s:e])
+        signal[s:e] += seg
+
+    pad = 0.02 * np.random.randn(len(t))
+    b, a = butter(4, [200 / (sr / 2), 800 / (sr / 2)], btype="band")
+    pad = filtfilt(b, a, pad)
+    signal += pad
+    signal = signal / (np.max(np.abs(signal)) + 1e-8)
+    return signal.astype(np.float32)
+
+
+def load_audio(cfg):
+    sr = cfg["sample_rate"]
+    dur = cfg["duration"]
+
+    if cfg["audio_path"] and os.path.exists(cfg["audio_path"]):
+        y, _ = librosa.load(cfg["audio_path"], sr=sr, duration=dur, mono=True)
+        print(f"[INFO] Loaded '{cfg['audio_path']}' | {len(y)/sr:.2f}s")
+    else:
+        print("[INFO] No audio file → synthesising demo melody...")
+        y = synthesise_music(sr, dur)
+
+    target = int(sr * dur)
+    if len(y) < target:
+        y = np.pad(y, (0, target - len(y)))
+    else:
+        y = y[:target]
+    return y, sr
+
+
+# =============================================================================
+# 2. DISTORTION
+# =============================================================================
+
+def distort_pitch(y, sr, steps):
+    return librosa.effects.pitch_shift(y=y, sr=sr, n_steps=steps).astype(np.float32)
+
+
+def add_perceptual_noise(y, amplitude):
+    return (y + amplitude * np.random.randn(len(y))).astype(np.float32)
+
+
+def disrupt_rhythm(y, mask_prob, frame_size=256):
+    """Smooth rhythm disruption (less clicking)"""
+    y_out = y.copy()
+    n_frames = len(y) // frame_size
+    mask = np.random.rand(n_frames) < mask_prob
+    for i, m in enumerate(mask):
+        if m:
+            start = i * frame_size
+            end = min(start + frame_size, len(y))
+            window = np.hanning(end - start)
+            y_out[start:end] *= (1.0 - window)
+    return y_out
+
+
+def apply_distortion(y, sr, cfg):
+    print("[INFO] Applying amusia-like distortions...")
+    y_d = distort_pitch(y, sr, cfg["pitch_shift_steps"])
+    y_d = add_perceptual_noise(y_d, cfg["noise_amplitude"])
+    y_d = disrupt_rhythm(y_d, cfg["rhythm_mask_prob"])
+    return y_d
+
+
+# =============================================================================
+# 3. SIGNAL PROCESSING RECONSTRUCTION (Baseline)
+# =============================================================================
+
+def sp_reconstruct(y_dist, sr):
+    D = librosa.stft(y_dist)
+    mag, phase = np.abs(D), np.angle(D)
+    noise_floor = np.percentile(mag, 15, axis=1, keepdims=True)
+    gain = np.maximum(0.0, 1.0 - noise_floor / (mag + 1e-8))
+    D_clean = gain * mag * np.exp(1j * phase)
+    y_sp = librosa.istft(D_clean, length=len(y_dist))
+
+    # Partial pitch correction
+    y_sp = librosa.effects.pitch_shift(
+        y=y_sp, sr=sr, n_steps=-CFG["pitch_shift_steps"] * 0.8
+    )
+    y_sp = medfilt(y_sp, kernel_size=9)
+    return y_sp.astype(np.float32)
+
+
+# =============================================================================
+# 4. FIXED AUTOENCODER
+# =============================================================================
+
+class AmusiaAutoencoder(nn.Module):
+    def __init__(self, frame_len=512, latent_dim=32):
+        super().__init__()
+        self.frame_len = frame_len
+        self.latent_dim = latent_dim
+
+        self.encoder = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=9, stride=2, padding=4),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(16, 32, kernel_size=9, stride=2, padding=4),
+            nn.LeakyReLU(0.2),
+            nn.Conv1d(32, 64, kernel_size=9, stride=2, padding=4),
+            nn.LeakyReLU(0.2),
+            nn.Flatten(),
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, frame_len)
+            flat_size = self.encoder(dummy).shape[1]
+
+        self.fc_enc = nn.Linear(flat_size, latent_dim)
+        self.fc_dec = nn.Linear(latent_dim, flat_size)
+
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (64, flat_size // 64)),
+            nn.ConvTranspose1d(64, 32, 9, stride=2, padding=4, output_padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose1d(32, 16, 9, stride=2, padding=4, output_padding=1),
+            nn.LeakyReLU(0.2),
+            nn.ConvTranspose1d(16, 1, 9, stride=2, padding=4, output_padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z = self.fc_enc(z)
+        z = self.fc_dec(z)
+        return self.decoder(z)
+
+
+def make_frames(signal, frame_len, hop_len):
+    frames = []
+    for start in range(0, len(signal) - frame_len + 1, hop_len):
+        frames.append(signal[start:start + frame_len])
+    return np.array(frames)
+
+
+def train_autoencoder(y_orig, y_dist, cfg):
+    FL = cfg["frame_len"]
+    HL = cfg["hop_len"]
+
+    frames_orig = make_frames(y_orig, FL, HL)
+    frames_dist = make_frames(y_dist, FL, HL)
+
+    def norm(x):
+        mx = np.max(np.abs(x), axis=1, keepdims=True) + 1e-8
+        return x / mx
+
+    X_d = torch.tensor(norm(frames_dist), dtype=torch.float32).unsqueeze(1)
+    X_o = torch.tensor(norm(frames_orig), dtype=torch.float32).unsqueeze(1)
+
+    loader = DataLoader(TensorDataset(X_d, X_o), batch_size=cfg["batch_size"], shuffle=True)
+
+    model = AmusiaAutoencoder(FL, cfg["latent_dim"]).to(DEVICE)
+    opt = optim.Adam(model.parameters(), lr=cfg["lr"])
+    loss_fn = nn.MSELoss()
+
+    print("[INFO] Training Autoencoder...")
+    for epoch in range(1, cfg["epochs"] + 1):
+        model.train()
+        epoch_loss = 0.0
+        for xd, xo in loader:
+            xd, xo = xd.to(DEVICE), xo.to(DEVICE)
+            pred = model(xd)
+            loss = loss_fn(pred, xo)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += loss.item()
+
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:2d}/{cfg['epochs']} | Loss: {epoch_loss/len(loader):.6f}")
+
+    return model
+
+
+def reconstruct_with_ae(y_dist, model, cfg):
+    FL = cfg["frame_len"]
+    HL = cfg["hop_len"]
+    frames = make_frames(y_dist, FL, HL)
+
+    norms = np.max(np.abs(frames), axis=1, keepdims=True) + 1e-8
+    X = torch.tensor(frames / norms, dtype=torch.float32).unsqueeze(1).to(DEVICE)
+
+    model.eval()
+    with torch.no_grad():
+        out = model(X).squeeze(1).cpu().numpy()
+
+    out = out * norms
+
+    # Overlap-Add
+    y_rec = np.zeros(len(y_dist))
+    count = np.zeros(len(y_dist))
+    pos = 0
+    for frame in out:
+        y_rec[pos:pos+FL] += frame
+        count[pos:pos+FL] += 1
+        pos += HL
+
+    y_rec /= np.maximum(count, 1)
+    return y_rec.astype(np.float32)
+
+
+# =============================================================================
+# 5. METRICS
+# =============================================================================
+
+def snr_db(reference, estimate):
+    min_l = min(len(reference), len(estimate))
+    noise = reference[:min_l] - estimate[:min_l]
+    s_pow = np.mean(reference[:min_l] ** 2)
+    n_pow = np.mean(noise ** 2) + 1e-12
+    return 10 * np.log10(s_pow / n_pow)
+
+
+def cosine_similarity(a, b):
+    min_l = min(len(a), len(b))
+    return 1.0 - cosine_dist(a[:min_l], b[:min_l])
+
+
+def mean_pitch_error(f0_ref, f0_est):
+    min_l = min(len(f0_ref), len(f0_est))
+    ref = f0_ref[:min_l]
+    est = f0_est[:min_l]
+    voiced = (ref > 0) & (est > 0)
+    if voiced.sum() == 0:
+        return float("nan")
+    return np.mean(np.abs(ref[voiced] - est[voiced]))
+
+
+def get_f0(y, sr):
+    f0, _, _ = librosa.pyin(y, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr)
+    return np.nan_to_num(f0)
+
+
+def compute_metrics(y_orig, y_dist, y_rec, sr):
+    f0_orig = get_f0(y_orig, sr)
+    f0_dist = get_f0(y_dist, sr)
+    f0_rec  = get_f0(y_rec, sr)
+
+    metrics = {
+        "SNR_distorted_dB"    : snr_db(y_orig, y_dist),
+        "SNR_reconstructed_dB": snr_db(y_orig, y_rec),
+        "CosSim_distorted"    : cosine_similarity(y_orig, y_dist),
+        "CosSim_reconstructed": cosine_similarity(y_orig, y_rec),
+        "MeanPitchErr_dist_Hz": mean_pitch_error(f0_orig, f0_dist),
+        "MeanPitchErr_rec_Hz" : mean_pitch_error(f0_orig, f0_rec),
+        "f0_orig": f0_orig,
+        "f0_dist": f0_dist,
+        "f0_rec" : f0_rec,
+    }
+
+    print("\n" + "="*60)
+    print("                 EVALUATION METRICS")
+    print("="*60)
+    for k, v in metrics.items():
+        if not k.startswith("f0"):
+            print(f"  {k:<28}: {v:.4f}")
+    print("="*60)
+    return metrics
+
+
+# =============================================================================
+# 6. VISUALISATION
+# =============================================================================
+
+CMAP_SPEC = LinearSegmentedColormap.from_list("amusia", ["#0d0221", "#2b0a5c", "#6a1bb5", "#c86dd4", "#f5d7ff"], N=256)
+
+def plot_comparison(y_orig, y_dist, y_rec, sr, metrics, cfg):
+    signals = [y_orig, y_dist, y_rec]
+    labels  = ["Original", "Distorted (Amusia-like)", "Reconstructed"]
+    colors  = ["#4fc3f7", "#ef9a9a", "#a5d6a7"]
+    f0s     = [metrics["f0_orig"], metrics["f0_dist"], metrics["f0_rec"]]
+
+    fig = plt.figure(figsize=(18, 12))
+    fig.patch.set_facecolor("#0d0221")
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.35,
+                           left=0.07, right=0.97, top=0.93, bottom=0.07)
+
+    for col, (sig, label, color, f0) in enumerate(zip(signals, labels, colors, f0s)):
+        t = np.linspace(0, len(sig)/sr, len(sig))
+        times_f0 = librosa.times_like(f0, sr=sr)
+
+        # Waveform
+        ax0 = fig.add_subplot(gs[0, col])
+        ax0.set_facecolor("#0d0221")
+        ax0.plot(t, sig, color=color, linewidth=0.7)
+        ax0.set_title(label, color="white", fontsize=12, fontweight="bold")
+        ax0.set_xlabel("Time (s)", color="#aaa")
+        ax0.tick_params(colors="#666")
+        if col == 0:
+            ax0.set_ylabel("Waveform", color="white", fontweight="bold")
+
+        # Mel Spectrogram
+        ax1 = fig.add_subplot(gs[1, col])
+        ax1.set_facecolor("#0d0221")
+        S_mel = librosa.feature.melspectrogram(y=sig, sr=sr, n_mels=128)
+        S_db = librosa.power_to_db(S_mel, ref=np.max)
+        librosa.display.specshow(S_db, sr=sr, x_axis="time", y_axis="mel", ax=ax1, cmap=CMAP_SPEC)
+        ax1.set_xlabel("Time (s)", color="#aaa")
+        ax1.tick_params(colors="#666")
+        if col == 0:
+            ax1.set_ylabel("Mel Spectrogram", color="white", fontweight="bold")
+
+        # F0 Contour
+        ax2 = fig.add_subplot(gs[2, col])
+        ax2.set_facecolor("#0d0221")
+        voiced = f0 > 0
+        ax2.plot(times_f0, np.where(voiced, f0, np.nan), color=color, linewidth=1.4)
+        ax2.set_ylim(0, 700)
+        ax2.set_xlabel("Time (s)", color="#aaa")
+        ax2.tick_params(colors="#666")
+        if col == 0:
+            ax2.set_ylabel("F0 Pitch (Hz)", color="white", fontweight="bold")
+
+    fig.suptitle("Auditory Perception Distortion Simulation\nAmusia-like Distortion & Reconstruction", 
+                 color="white", fontsize=15, fontweight="bold", y=0.97)
+    
+    save_path = os.path.join(cfg["out_dir"], cfg["fig_path"])
+    plt.savefig(save_path, dpi=160, facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"[INFO] Plot saved → {save_path}")
+
+
+# =============================================================================
+# 7. SAVE AUDIO
+# =============================================================================
+
+def save_audio_files(y_orig, y_dist, y_rec, sr, out_dir):
+    for name, sig in [("original.wav", y_orig),
+                      ("distorted.wav", y_dist),
+                      ("reconstructed.wav", y_rec)]:
+        path = os.path.join(out_dir, name)
+        sf.write(path, sig, sr)
+        print(f"[INFO] Audio saved → {path}")
+
+
+# =============================================================================
+# 8. MAIN
+# =============================================================================
+
+def main():
+    print("\n" + "="*65)
+    print("     AMUSIA SIMULATION PIPELINE (Fixed & Improved)")
+    print("="*65)
+
+    y_orig, sr = load_audio(CFG)
+    y_dist = apply_distortion(y_orig, sr, CFG)
+
+    print("\n[4a] Signal Processing Reconstruction...")
+    y_sp = sp_reconstruct(y_dist, sr)
+
+    print("\n[4b] Training Autoencoder...")
+    model = train_autoencoder(y_orig, y_dist, CFG)
+    y_ae = reconstruct_with_ae(y_dist, model, CFG)
+
+    # Blend
+    min_len = min(len(y_sp), len(y_ae), len(y_orig))
+    y_rec = (0.35 * y_sp[:min_len] + 0.65 * y_ae[:min_len]).astype(np.float32)
+
+    print("\n[5] Computing Metrics...")
+    metrics = compute_metrics(y_orig, y_dist, y_rec, sr)
+
+    print("\n[6] Generating Visualization...")
+    plot_comparison(y_orig, y_dist, y_rec, sr, metrics, CFG)
+
+    print("\n[7] Saving Audio Files...")
+    save_audio_files(y_orig, y_dist, y_rec, sr, CFG["out_dir"])
+
+    torch.save(model.state_dict(), os.path.join(CFG["out_dir"], "autoencoder.pt"))
+    print(f"\n🎉 Pipeline Completed Successfully!\nOutputs saved in: {CFG['out_dir']}")
+
+
+if __name__ == "__main__":
+    results = main()
